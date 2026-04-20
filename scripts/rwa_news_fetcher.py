@@ -1,7 +1,9 @@
 """
-RWA News Monitor v3
-新增：中文信息源 / 交易所公告监控 / Pre-IPO 关键词 / 股票代币化平台
-去重：URL 精确 + 标题 Jaccard 相似度
+RWA News Monitor v3.1
+- 修复：update_health_and_alert 函数顺序问题（NameError）
+- 修复：Messari RSS URL (404→新URL) / 区块律动(403) / 吴说(403) / CT中文(410) 已更新或移除
+- 功能：中英文双语信息源 / 交易所公告监控 / Pre-IPO关键词 / 实时+日报双模式
+- 防护：Lark限速+重试 / 冷启动保护 / 单次推送上限 / 标题hash去重 / 日报卡片拆分
 """
 
 import os, re, json, hashlib, unicodedata, requests, feedparser, argparse, time
@@ -12,15 +14,15 @@ from pathlib import Path
 # 环境 & 常量
 # ──────────────────────────────────────────────────────────────────
 
-LARK_WEBHOOK   = os.environ.get("LARK_WEBHOOK_URL", "")
-SGT            = timezone(timedelta(hours=8))
-SEEN_FILE      = Path(__file__).parent.parent / ".seen_articles.json"
-HEALTH_FILE    = Path(__file__).parent.parent / ".feed_health.json"
+LARK_WEBHOOK       = os.environ.get("LARK_WEBHOOK_URL", "")
+SGT                = timezone(timedelta(hours=8))
+SEEN_FILE          = Path(__file__).parent.parent / ".seen_articles.json"
+HEALTH_FILE        = Path(__file__).parent.parent / ".feed_health.json"
 
-# Lark 每分钟限 5 条，推送间隔 13s 保证不超限
-LARK_SEND_INTERVAL = 13          # 秒
-LARK_MAX_RETRIES   = 3           # 单条推送最多重试次数
-FEED_FAIL_ALERT_N  = 3           # 连续失败 N 次触发告警
+LARK_SEND_INTERVAL = 13   # 秒，Lark 限 5条/分钟，13s 间隔保证不超限
+LARK_MAX_RETRIES   = 3    # 单条推送最多重试次数
+FEED_FAIL_ALERT_N  = 3    # 连续失败 N 次触发 Lark 告警
+INSTANT_MAX_PUSH   = 8    # 单次实时运行最多推送条数（防洪水）
 
 # ──────────────────────────────────────────────────────────────────
 # ① 关键词（中英双语，命中任意一个即触发）
@@ -80,36 +82,24 @@ KEYWORDS = [
     "Swarm Markets", "Robinhood tokenized",
     "USD1", "Plume Network", "Mantra chain",
 
-    # ── 交易所 TradFi 功能（重点监控）────────────────────────────
-    # Bitget
+    # ── 交易所专项监控 ────────────────────────────────────────────
     "Bitget tokenized", "Bitget stock", "Bitget IPO Prime",
     "Bitget stocks", "Bitget RWA", "Bitget xStocks",
-    "IPO Prime Bitget",
-    # Binance
     "Binance tokenized stock", "Binance on-chain stock",
     "Binance xStocks", "Binance RWA", "Binance Pre-IPO",
-    "Binance chain stock", "币安链上股票", "币安股票代币",
-    # Bybit
+    "币安链上股票", "币安股票代币",
     "Bybit tokenized", "Bybit stock token", "Bybit RWA",
     "Bybit xStocks", "Bybit Pre-IPO",
-    # Gate
     "Gate tokenized", "Gate stock", "Gate RWA",
-    "Gate Pre-IPO", "Gate.io tokenized", "Gate.io stocks",
-    "Gate pre-market", "Gate 股票代币",
-    # OKX
-    "OKX tokenized", "OKX stock token", "OKX RWA",
-    "OKX xStocks",
-    # Kraken
+    "Gate Pre-IPO", "Gate.io tokenized", "Gate 股票代币",
+    "OKX tokenized", "OKX stock token", "OKX RWA", "OKX xStocks",
     "Kraken xStocks", "Kraken tokenized stock",
-    "Kraken stock token",
-    # Coinbase
     "Coinbase tokenized stock", "Coinbase stock token",
 
-    # ── 股票代币化平台（专项监控）────────────────────────────────
+    # ── 股票代币化平台专项 ────────────────────────────────────────
     "xStocks", "StableStock", "MSX", "Jarsy", "PreStocks",
-    "Republic tokenized", "Backed Finance",
-    "Ondo Global Markets", "Dinari", "Swarm Markets",
-    "tZERO", "INX tokenized", "TokenSoft",
+    "Republic tokenized", "Ondo Global Markets",
+    "Dinari", "tZERO", "INX tokenized", "TokenSoft",
     "股票代币平台", "股票通证平台",
 
     # ── 上新资产 / 功能更新触发词 ─────────────────────────────────
@@ -121,188 +111,137 @@ KEYWORDS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────
-# ② 信息源（分四梯队）
+# ② 信息源
+# 状态说明：✅已验证  ⚠️待验证  ❌已确认失效（保留注释供参考）
 # ──────────────────────────────────────────────────────────────────
-#
-# ✅ 已经过多源交叉确认的 RSS
-# ⚠️ 来自聚合器引用，格式合理，上线建议验证一次
-# 📌 Google News RSS（免费，覆盖 Bloomberg/Reuters/FT 摘要）
-# 🏛️ 交易所/平台公告（官方 RSS 或 Google News 替代）
-# 🇨🇳 中文媒体
-#
 
 RSS_FEEDS = [
 
-    # ════════════════════════════════════════════════════════
-    # 梯队 1｜英文加密专业媒体（RWA 直接覆盖，最高优先级）
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════
+    # 梯队 1｜英文加密专业媒体
+    # ════════════════════════════════════════════════════
     {
         "name": "CoinTelegraph",
         "url": "https://cointelegraph.com/rss",
-        "tier": 1, "lang": "en",
-        # ✅ 官方 RSS，全球最大加密媒体，RWA 专栏活跃
+        "tier": 1, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "Blockworks",
         "url": "https://blockworks.co/feed/",
-        "tier": 1, "lang": "en",
-        # ✅ chainfeeds 项目确认，机构级加密媒体
+        "tier": 1, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "Decrypt",
         "url": "https://decrypt.co/feed",
-        "tier": 1, "lang": "en",
-        # ✅ 多源确认，tokenization 覆盖好
+        "tier": 1, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "The Defiant",
         "url": "https://thedefiant.io/api/feed",
-        "tier": 1, "lang": "en",
-        # ✅ feedspot 确认，DeFi/RWA 专注媒体
+        "tier": 1, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "Messari",
-        "url": "https://messari.io/rss",
-        "tier": 1, "lang": "en",
-        # ✅ 多源确认，研究级内容，机构视角
+        "url": "https://messari.io/news/rss",       # ← 原 /rss 已404，改为 /news/rss
+        "tier": 1, "lang": "en",   # ⚠️ URL已更新，待验证
     },
     {
         "name": "CryptoSlate RWA",
         "url": "https://cryptoslate.com/feed/rwa/",
-        "tier": 1, "lang": "en",
-        # ⚠️ CryptoSlate 有 RWA 专栏，RSS 格式待验证
+        "tier": 1, "lang": "en",   # ✅ 实测可用（返回0条是正常的，无新文章时如此）
     },
 
-    # ════════════════════════════════════════════════════════
-    # 梯队 2｜中文加密媒体（覆盖亚洲/华语市场动态）
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════
+    # 梯队 2｜中文加密媒体
+    # ════════════════════════════════════════════════════
     {
         "name": "PANews 律动",
         "url": "https://www.panewslab.com/zh/rss",
-        "tier": 2, "lang": "zh",
-        # ✅ PANews 官网有 RSS 订阅入口（/zh/rss 或 /rss）
-        # 备用：https://www.panewslab.com/rss
+        "tier": 2, "lang": "zh",   # ✅ 实测可用
     },
     {
         "name": "动区动趋 BlockTempo",
         "url": "https://www.blocktempo.com/feed/",
-        "tier": 2, "lang": "zh",
-        # ✅ WordPress 建站，标准 /feed/ 路径，台湾最大链媒
+        "tier": 2, "lang": "zh",   # ✅ 实测可用
     },
     {
         "name": "Odaily 星球日报",
         "url": "https://www.odaily.news/rss",
-        "tier": 2, "lang": "zh",
-        # ⚠️ Odaily 有 RSS 订阅（/rss 路径），国内头部加密媒体
-    },
-    {
-        "name": "区块律动 BlockBeats",
-        "url": "https://www.theblockbeats.info/rss",
-        "tier": 2, "lang": "zh",
-        # ⚠️ BlockBeats 站点有 RSS，路径待验证
+        "tier": 2, "lang": "zh",   # ✅ 实测可用
     },
     {
         "name": "链新闻 ABMedia",
         "url": "https://abmedia.io/feed",
-        "tier": 2, "lang": "zh",
-        # ⚠️ 台湾链新闻，WordPress 架构，/feed 路径
+        "tier": 2, "lang": "zh",   # ✅ 实测可用
     },
     {
         "name": "吴说区块链 WuBlock",
-        "url": "https://wublock.substack.com/feed",
-        "tier": 2, "lang": "zh",
-        # ✅ Substack 出版物，RSS 格式固定为 /feed，有效
+        "url": "https://wublockchain.substack.com/feed",  # ← 原URL 403，改为新域名
+        "tier": 2, "lang": "zh",   # ⚠️ URL已更新，待验证
     },
-    {
-        "name": "ChainFeeds 精选（中文）",
-        "url": "https://www.chainfeeds.xyz/rss",
-        "tier": 2, "lang": "zh",
-        # ✅ chainfeeds 项目自列，Web3 精选信息聚合
-    },
-    {
-        "name": "CoinTelegraph 中文",
-        "url": "https://cn.cointelegraph.com/rss",
-        "tier": 2, "lang": "zh",
-        # ✅ CoinTelegraph 有官方中文版，RSS 与英文版同架构
-    },
+    # 以下已确认失效，注释保留：
+    # {"name": "区块律动 BlockBeats", "url": "https://www.theblockbeats.info/rss"},  # 403
+    # {"name": "ChainFeeds 精选", "url": "https://www.chainfeeds.xyz/rss"},          # 502
+    # {"name": "CoinTelegraph 中文", "url": "https://cn.cointelegraph.com/rss"},     # 410 已下线
 
-    # ════════════════════════════════════════════════════════
-    # 梯队 3｜英文通用加密媒体（配合关键词过滤，增加覆盖面）
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════
+    # 梯队 3｜英文通用媒体
+    # ════════════════════════════════════════════════════
     {
         "name": "CoinDesk",
         "url": "https://feeds.feedburner.com/CoinDesk",
-        "tier": 3, "lang": "en",
-        # ⚠️ feedburner 链接来自 chainfeeds 引用
+        "tier": 3, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "CryptoBriefing",
         "url": "https://cryptobriefing.com/feed/",
-        "tier": 3, "lang": "en",
-        # ⚠️ 多源确认
-    },
-    {
-        "name": "AMBCrypto",
-        "url": "https://ambcrypto.com/feed",
-        "tier": 3, "lang": "en",
-        # ⚠️ 多源确认
+        "tier": 3, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "NewsBTC",
         "url": "https://newsbtc.com/feed",
-        "tier": 3, "lang": "en",
-        # ⚠️ 多源确认
+        "tier": 3, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "CryptoNews",
         "url": "https://crypto.news/feed",
-        "tier": 3, "lang": "en",
-        # ⚠️ 多源确认
+        "tier": 3, "lang": "en",   # ✅ 实测可用
     },
     {
         "name": "Bitcoin Magazine",
         "url": "https://bitcoinmagazine.com/.rss/full/",
-        "tier": 3, "lang": "en",
-        # ⚠️ 多源确认
+        "tier": 3, "lang": "en",   # ✅ 实测可用
     },
+    # 以下已确认失效，注释保留：
+    # {"name": "AMBCrypto", "url": "https://ambcrypto.com/feed"},  # 403
 
-    # ════════════════════════════════════════════════════════
-    # 梯队 4｜交易所 & 平台公告（Google News RSS 代理）
-    # ────────────────────────────────────────────────────────
-    # 注：Binance/Bitget/Gate/Bybit 官方公告页为 JS 渲染，无原生 RSS。
-    # 通过 Google News RSS 搜索这些交易所的公告和媒体报道，
-    # 可以覆盖到 Cointelegraph、The Block、CoinDesk 等媒体
-    # 对这些平台新上线功能/资产的第一手报道。
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════
+    # 梯队 4｜Google News RSS（覆盖 Bloomberg/Reuters/FT 摘要 + 交易所报道）
+    # ════════════════════════════════════════════════════
     {
         "name": "Google News: Binance tokenized stocks",
         "url": "https://news.google.com/rss/search?q=Binance+tokenized+stock+OR+%22Binance+xStocks%22+OR+%22Binance+Pre-IPO%22&hl=en&gl=US&ceid=US:en",
         "tier": 4, "lang": "en", "is_google_news": True,
-        # 📌 Binance 链上股票 / Pre-IPO / RWA 动态
     },
     {
         "name": "Google News: Bitget IPO Prime stocks",
         "url": "https://news.google.com/rss/search?q=Bitget+%22IPO+Prime%22+OR+%22tokenized+stock%22+OR+%22xStocks%22&hl=en&gl=US&ceid=US:en",
         "tier": 4, "lang": "en", "is_google_news": True,
-        # 📌 Bitget IPO Prime / 股票代币化动态
     },
     {
         "name": "Google News: Bybit Gate tokenized stocks",
         "url": "https://news.google.com/rss/search?q=Bybit+OR+Gate.io+%22tokenized+stock%22+OR+%22stock+token%22+OR+%22Pre-IPO%22&hl=en&gl=US&ceid=US:en",
         "tier": 4, "lang": "en", "is_google_news": True,
-        # 📌 Bybit / Gate 股票代币动态
     },
     {
         "name": "Google News: xStocks StableStock Jarsy PreStocks",
         "url": "https://news.google.com/rss/search?q=xStocks+OR+StableStock+OR+Jarsy+OR+PreStocks+tokenized&hl=en&gl=US&ceid=US:en",
         "tier": 4, "lang": "en", "is_google_news": True,
-        # 📌 专项股票代币化平台动态
     },
     {
         "name": "Google News: RWA tokenization",
         "url": "https://news.google.com/rss/search?q=RWA+tokenization&hl=en&gl=US&ceid=US:en",
         "tier": 4, "lang": "en", "is_google_news": True,
-        # 📌 核心 RWA 词（覆盖 Bloomberg/Reuters/FT 摘要）
     },
     {
         "name": "Google News: real world assets blockchain",
@@ -318,7 +257,6 @@ RSS_FEEDS = [
         "name": "Google News: Pre-IPO crypto tokenized",
         "url": "https://news.google.com/rss/search?q=%22Pre-IPO%22+tokenized+OR+%22tokenized+pre-IPO%22+OR+%22IPO+Prime%22&hl=en&gl=US&ceid=US:en",
         "tier": 4, "lang": "en", "is_google_news": True,
-        # 📌 Pre-IPO 代币化专项
     },
     {
         "name": "Google News: Securitize Ondo tokenization",
@@ -329,7 +267,6 @@ RSS_FEEDS = [
         "name": "Google News (中文): RWA 代币化 链上股票",
         "url": "https://news.google.com/rss/search?q=RWA+%E4%BB%A3%E5%B8%81%E5%8C%96+OR+%E9%93%BE%E4%B8%8A%E8%82%A1%E7%A5%A8+OR+%E8%82%A1%E7%A5%A8%E4%BB%A3%E5%B8%81&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
         "tier": 4, "lang": "zh", "is_google_news": True,
-        # 📌 中文 Google News，覆盖新浪财经/东方财富等中文媒体
     },
     {
         "name": "Google News (中文): Pre-IPO 预上市 交易所",
@@ -339,21 +276,23 @@ RSS_FEEDS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────
-# 工具：文本处理 & 去重
+# 工具函数
 # ──────────────────────────────────────────────────────────────────
 
 def normalize_title(t: str) -> str:
     t = t.lower()
     t = unicodedata.normalize("NFKC", t)
     t = re.sub(r"[^\w\s]", " ", t)
-    stopwords = {"the","a","an","in","on","of","to","for","and","or","is",
-                 "are","was","were","has","have","its","this","that","with",
-                 "by","at","from","as","be","it","new","says","said","的","了",
-                 "在","是","与","及","将","已","于","对","其","等","有","为"}
+    stopwords = {
+        "the","a","an","in","on","of","to","for","and","or","is","are",
+        "was","were","has","have","its","this","that","with","by","at",
+        "from","as","be","it","new","says","said",
+        "的","了","在","是","与","及","将","已","于","对","其","等","有","为",
+    }
     words = [w for w in t.split() if w not in stopwords and len(w) > 1]
     return " ".join(sorted(words))
 
-def jaccard(a: str, b: str, threshold=0.55) -> bool:
+def jaccard(a: str, b: str, threshold: float = 0.55) -> bool:
     sa = set(normalize_title(a).split())
     sb = set(normalize_title(b).split())
     if not sa or not sb:
@@ -367,20 +306,75 @@ def article_uid(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
 
 def title_uid(title: str) -> str:
-    """
-    标题指纹。Google News RSS 每次返回跳转 URL 不固定，
-    同一篇文章每次 URL 不同，用标题 hash 作为去重 key。
-    """
+    """标题指纹，用于 Google News 跳转URL去重（每次URL不同但标题固定）"""
     return "t:" + hashlib.md5(normalize_title(title).encode()).hexdigest()
 
-# 单次实时运行最多推送条数（防止缓存丢失后洪水推送）
-INSTANT_MAX_PUSH = 8
+# ──────────────────────────────────────────────────────────────────
+# 信息源健康监控（必须定义在 fetch_all 之前）
+# ──────────────────────────────────────────────────────────────────
+
+def load_health() -> dict:
+    if HEALTH_FILE.exists():
+        try:
+            return json.loads(HEALTH_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_health(health: dict):
+    HEALTH_FILE.write_text(json.dumps(health))
+
+def update_health_and_alert(status_lines: list):
+    """
+    解析 fetch_all 状态行，更新连续失败计数。
+    某个源连续失败 FEED_FAIL_ALERT_N 次时，推送 Lark 红色告警。
+    """
+    health = load_health()
+    alerts = []
+
+    for line in status_lines:
+        if "✅" in line:
+            name = line.split("]", 1)[-1].split(":")[0].strip()
+            health[name] = 0
+        elif "❌" in line:
+            name = line.split("]", 1)[-1].split(":")[0].strip()
+            health[name] = health.get(name, 0) + 1
+            if health[name] == FEED_FAIL_ALERT_N:
+                err = line.split(":", 2)[-1].strip() if line.count(":") >= 2 else "未知错误"
+                alerts.append(f"• **{name}** 已连续失败 {health[name]} 次（{err}）")
+
+    save_health(health)
+
+    if alerts and LARK_WEBHOOK:
+        body = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "⚠️ RWA Bot 信息源异常告警"},
+                    "template": "red",
+                },
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md",
+                        "content": "以下信息源**连续失败 {} 次**，请检查：\n\n{}".format(
+                            FEED_FAIL_ALERT_N, "\n".join(alerts)
+                        )}},
+                    {"tag": "note", "elements": [{"tag": "plain_text",
+                        "content": "💡 应急：在 RSS_FEEDS 中注释该源，或更新 URL"}]},
+                ],
+            },
+        }
+        try:
+            requests.post(LARK_WEBHOOK, json=body, timeout=12)
+            print(f"[告警] 已推送信息源异常告警：{len(alerts)} 个源")
+        except Exception as e:
+            print(f"[ERR] 告警推送失败: {e}")
 
 # ──────────────────────────────────────────────────────────────────
 # 抓取
 # ──────────────────────────────────────────────────────────────────
 
-def fetch_all(hours_back: int = 25) -> list[dict]:
+def fetch_all(hours_back: float = 25) -> list:
     cutoff = datetime.now(SGT) - timedelta(hours=hours_back)
     articles = []
     status_lines = []
@@ -389,7 +383,7 @@ def fetch_all(hours_back: int = 25) -> list[dict]:
         try:
             feed = feedparser.parse(
                 cfg["url"],
-                agent="Mozilla/5.0 (compatible; RWA-NewsBot/3.0; +https://github.com)"
+                agent="Mozilla/5.0 (compatible; RWA-NewsBot/3.1; +https://github.com)"
             )
             if feed.get("status", 200) >= 400:
                 raise Exception(f"HTTP {feed.get('status')}")
@@ -407,13 +401,12 @@ def fetch_all(hours_back: int = 25) -> list[dict]:
                 if not title or not url:
                     continue
 
-                # 中文乱码修复：GBK 编码的 RSS 经 feedparser 解析后可能出现
-                # \u00xx 形式的乱码，尝试 latin-1 → utf-8 重新解码
+                # 中文乱码修复（GBK→UTF-8）
                 try:
                     title   = title.encode("latin-1").decode("utf-8")
                     summary = summary.encode("latin-1").decode("utf-8")
                 except (UnicodeEncodeError, UnicodeDecodeError):
-                    pass  # 编码正常，跳过
+                    pass
 
                 articles.append({
                     "source":    cfg["name"],
@@ -437,16 +430,14 @@ def fetch_all(hours_back: int = 25) -> list[dict]:
     for s in status_lines:
         print(s)
 
-    # 健康检查：连续失败源告警
     update_health_and_alert(status_lines)
-
     return articles
 
 # ──────────────────────────────────────────────────────────────────
 # 过滤 & 去重
 # ──────────────────────────────────────────────────────────────────
 
-def filter_keywords(articles: list[dict]) -> list[dict]:
+def filter_keywords(articles: list) -> list:
     out = []
     for a in articles:
         text = f"{a['title']} {a['summary']}".lower()
@@ -456,56 +447,44 @@ def filter_keywords(articles: list[dict]) -> list[dict]:
             out.append(a)
     return out
 
-def deduplicate(articles: list[dict]) -> list[dict]:
-    """
-    tier 升序 + 时间升序排序（最优质、最早的版本被保留）
-    两层去重：URL精确 + 标题Jaccard相似度(0.55)
-    """
+def deduplicate(articles: list) -> list:
     sorted_arts = sorted(articles, key=lambda x: (x["tier"], x["pub_dt"]))
     seen_urls   = set()
     seen_titles = []
     unique      = []
-
     for a in sorted_arts:
-        uid = article_uid(a["url"])
-        if uid in seen_urls:
+        if article_uid(a["url"]) in seen_urls:
             continue
         if any(jaccard(a["title"], t) for t in seen_titles):
             continue
-        seen_urls.add(uid)
+        seen_urls.add(article_uid(a["url"]))
         seen_titles.append(a["title"])
         unique.append(a)
-
     return unique
 
 # ──────────────────────────────────────────────────────────────────
-# Lark 推送
+# Lark 推送（限速 + 重试）
 # ──────────────────────────────────────────────────────────────────
 
-def _post_lark(body: dict, label: str, _last_send: list = [0.0]):
-    """
-    推送单条 Lark 消息。
-    - 自动限速：两次推送之间至少间隔 LARK_SEND_INTERVAL 秒（Lark 限 5条/分钟）
-    - 自动重试：失败最多重试 LARK_MAX_RETRIES 次，指数退避
-    """
+_last_send_time = [0.0]  # 模块级共享状态，跟踪上次发送时间
+
+def _post_lark(body: dict, label: str):
     if not LARK_WEBHOOK:
         print(f"[DRY RUN] {label}")
         return
 
-    # 限速：距上次发送不足间隔则等待
-    elapsed = time.time() - _last_send[0]
+    elapsed = time.time() - _last_send_time[0]
     if elapsed < LARK_SEND_INTERVAL:
         time.sleep(LARK_SEND_INTERVAL - elapsed)
 
     for attempt in range(1, LARK_MAX_RETRIES + 1):
         try:
             r = requests.post(LARK_WEBHOOK, json=body, timeout=12)
-            _last_send[0] = time.time()
+            _last_send_time[0] = time.time()
             if r.status_code == 200:
-                resp_json = r.json() if r.content else {}
-                if resp_json.get("code", 0) != 0:
-                    msg = resp_json.get("msg", "unknown")
-                    print(f"[WARN] Lark 业务错误 code={resp_json['code']} msg={msg}（{label}）")
+                resp = r.json() if r.content else {}
+                if resp.get("code", 0) != 0:
+                    print(f"[WARN] Lark code={resp['code']} msg={resp.get('msg')}（{label}）")
                     if attempt < LARK_MAX_RETRIES:
                         time.sleep(2 ** attempt)
                         continue
@@ -513,7 +492,7 @@ def _post_lark(body: dict, label: str, _last_send: list = [0.0]):
                     print(f"[OK] {label}")
                     return
             else:
-                print(f"[WARN] HTTP {r.status_code}（{label}），第{attempt}次")
+                print(f"[WARN] HTTP {r.status_code}（{label}）第{attempt}次")
                 if attempt < LARK_MAX_RETRIES:
                     time.sleep(2 ** attempt)
         except Exception as e:
@@ -521,49 +500,36 @@ def _post_lark(body: dict, label: str, _last_send: list = [0.0]):
             if attempt < LARK_MAX_RETRIES:
                 time.sleep(2 ** attempt)
 
-    print(f"[ERR] 推送彻底失败，已放弃: {label}")
+    print(f"[ERR] 推送失败，已放弃: {label}")
+
 
 def push_instant(a: dict):
     lang_flag = "🇨🇳" if a.get("lang") == "zh" else "🌐"
     kw_str = "  ".join([f"`{k}`" for k in a.get("matched_kws", [])[:5]])
 
-    # 判断类型标签
-    is_preipo   = any(k in str(a.get("matched_kws","")).lower() for k in ["pre-ipo","pre ipo","ipo prime","预上市"])
-    is_exchange = any(k in a["title"].lower() for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"])
-    is_tradfi   = any(k in str(a.get("matched_kws","")).lower() for k in ["tradfi","xstocks","stablestock","jarsy","prestocks"])
-
-    if is_preipo:
-        badge = "🔮 Pre-IPO"
-        color = "purple"
-    elif is_exchange:
-        badge = "🏦 交易所动态"
-        color = "orange"
-    elif is_tradfi:
-        badge = "📈 股票代币化"
-        color = "indigo"
+    kws_lower = str(a.get("matched_kws", "")).lower()
+    if any(k in kws_lower for k in ["pre-ipo", "ipo prime", "pre ipo", "预上市"]):
+        badge, color = "🔮 Pre-IPO", "purple"
+    elif any(k in a["title"].lower() for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"]):
+        badge, color = "🏦 交易所动态", "orange"
+    elif any(k in kws_lower for k in ["tradfi","xstocks","stablestock","jarsy","prestocks"]):
+        badge, color = "📈 股票代币化", "indigo"
     else:
-        badge = "📡 RWA 快讯"
-        color = "blue"
+        badge, color = "📡 RWA 快讯", "blue"
 
     body = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": f"{lang_flag} {badge}"},
-                "template": color,
-            },
+            "header": {"title": {"tag": "plain_text", "content": f"{lang_flag} {badge}"}, "template": color},
             "elements": [
                 {"tag": "div", "text": {"tag": "lark_md", "content": f"**{a['title']}**"}},
                 {"tag": "div", "text": {"tag": "lark_md", "content": a["summary"] or "_（无摘要）_"}},
                 {"tag": "hr"},
-                {
-                    "tag": "div",
-                    "fields": [
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**来源**\n{a['source']}"}},
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**时间**\n{a['published']}"}},
-                    ],
-                },
+                {"tag": "div", "fields": [
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**来源**\n{a['source']}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**时间**\n{a['published']}"}},
+                ]},
                 {"tag": "div", "text": {"tag": "lark_md", "content": f"**命中关键词** · {kw_str}"}},
                 {"tag": "action", "actions": [
                     {"tag": "button", "text": {"tag": "plain_text", "content": "阅读原文 →"},
@@ -575,99 +541,81 @@ def push_instant(a: dict):
     _post_lark(body, f"即时 [{a['source']}] {a['title'][:55]}")
 
 
-def push_daily_digest(articles: list[dict]):
+def push_daily_digest(articles: list):
     if not articles:
         print("[INFO] 今日无 RWA 相关新闻，跳过推送")
         return
 
     today = datetime.now(SGT).strftime("%Y年%m月%d日")
 
-    # 按类别分组
     groups = {
-        "🔮 Pre-IPO 动态":   [],
-        "🏦 交易所 & 平台":   [],
-        "📈 股票代币化":      [],
-        "🌐 英文 RWA 资讯":   [],
-        "🇨🇳 中文 RWA 资讯":  [],
+        "🔮 Pre-IPO 动态":  [],
+        "🏦 交易所 & 平台":  [],
+        "📈 股票代币化":     [],
+        "🌐 英文 RWA 资讯":  [],
+        "🇨🇳 中文 RWA 资讯": [],
     }
 
     for a in articles:
-        kws_str = " ".join(a.get("matched_kws", [])).lower()
-        title_l = a["title"].lower()
-        is_preipo = any(k in kws_str for k in ["pre-ipo","ipo prime","pre ipo","预上市","preSPAX".lower()])
-        is_exch   = any(k in title_l for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"])
-        is_stock  = any(k in kws_str for k in ["xstocks","stablestock","jarsy","prestocks","链上股票","股票代币","stock token","tokenized stock"])
-
-        if is_preipo:
+        kws = " ".join(a.get("matched_kws", [])).lower()
+        tl  = a["title"].lower()
+        if any(k in kws for k in ["pre-ipo","ipo prime","pre ipo","预上市","prespacex"]):
             groups["🔮 Pre-IPO 动态"].append(a)
-        elif is_exch:
+        elif any(k in tl for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"]):
             groups["🏦 交易所 & 平台"].append(a)
-        elif is_stock:
+        elif any(k in kws for k in ["xstocks","stablestock","jarsy","prestocks","链上股票","股票代币","stock token","tokenized stock"]):
             groups["📈 股票代币化"].append(a)
         elif a.get("lang") == "zh":
             groups["🇨🇳 中文 RWA 资讯"].append(a)
         else:
             groups["🌐 英文 RWA 资讯"].append(a)
 
-    total = sum(len(v) for v in groups.values())
-    zh_count = len(groups["🇨🇳 中文 RWA 资讯"]) + sum(
-        1 for a in articles if a.get("lang") == "zh"
-    )
+    total    = sum(len(v) for v in groups.values())
+    zh_count = len(groups["🇨🇳 中文 RWA 资讯"])
 
     elements = [
         {"tag": "div", "text": {"tag": "lark_md",
-            "content": f"今日去重后共 **{total}** 条 RWA 资讯 · "
-                       f"中文 {len(groups['🇨🇳 中文 RWA 资讯'])} 条 · 英文 {total - len(groups['🇨🇳 中文 RWA 资讯'])} 条"}},
+            "content": f"今日去重后共 **{total}** 条 RWA 资讯 · 中文 {zh_count} 条 · 英文 {total - zh_count} 条"}},
         {"tag": "hr"},
     ]
-
     for group_name, arts in groups.items():
         if not arts:
             continue
         lines = [f"**{group_name}** · {len(arts)} 条"]
         for a in arts[:8]:
-            lang_flag = "🇨🇳" if a.get("lang") == "zh" else ""
-            lines.append(f"• {lang_flag} [{a['title'][:75]}]({a['url']})")
+            flag = "🇨🇳 " if a.get("lang") == "zh" else ""
+            lines.append(f"• {flag}[{a['title'][:75]}]({a['url']})")
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}})
         elements.append({"tag": "hr"})
 
     elements.append({"tag": "note", "elements": [{"tag": "plain_text",
-        "content": f"🤖 RWA NewsBot v3 · {datetime.now(SGT).strftime('%H:%M SGT')} · Jaccard 去重 · {len(RSS_FEEDS)} 个信息源"}]})
+        "content": f"🤖 RWA NewsBot v3.1 · {datetime.now(SGT).strftime('%H:%M SGT')} · {len(RSS_FEEDS)} 个信息源"}]})
 
     body = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": f"📰 RWA 日报 · {today}"},
-                "template": "green",
-            },
+            "header": {"title": {"tag": "plain_text", "content": f"📰 RWA 日报 · {today}"}, "template": "green"},
             "elements": elements,
         },
     }
-    # ── 卡片超长保护 ─────────────────────────────────────────────
-    # Lark 卡片 elements 过多时渲染失败（经验值 >40 个 element 开始不稳定）。
-    # 超出时拆成两条消息发送。
+
+    # 卡片超长保护：>38 个 element 时拆成两条
     MAX_ELEMENTS = 38
     if len(elements) > MAX_ELEMENTS:
-        body1 = {k: v for k, v in body.items()}
-        body1["card"] = {**body["card"], "elements": elements[:MAX_ELEMENTS] + [
-            {"tag": "note", "elements": [{"tag": "plain_text",
-             "content": f"（内容过多，续见下一条消息）"}]}
-        ]}
-        body2 = {k: v for k, v in body.items()}
-        body2["card"] = {**body["card"],
+        body2 = {**body, "card": {**body["card"],
             "header": {**body["card"]["header"],
                 "title": {"tag": "plain_text", "content": f"📰 RWA 日报续 · {today}"}},
-            "elements": elements[MAX_ELEMENTS:]
-        }
-        _post_lark(body1, f"日报推送（上）{total} 条")
+            "elements": elements[MAX_ELEMENTS:]}}
+        body["card"]["elements"] = elements[:MAX_ELEMENTS] + [
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "（内容过多，续见下一条）"}]}]
+        _post_lark(body,  f"日报推送（上）{total} 条")
         _post_lark(body2, f"日报推送（下）{total} 条")
     else:
         _post_lark(body, f"日报推送 {total} 条")
 
 # ──────────────────────────────────────────────────────────────────
-# 实时缓存
+# 缓存管理
 # ──────────────────────────────────────────────────────────────────
 
 def load_cache() -> dict:
@@ -680,21 +628,14 @@ def load_cache() -> dict:
     return {}
 
 def save_cache(cache: dict):
-    # 只保留最近 3000 条，防止文件无限增长
     if len(cache) > 3000:
         cache = dict(list(cache.items())[-3000:])
     SEEN_FILE.write_text(json.dumps(cache))
 
 def is_seen(a: dict, cache: dict) -> bool:
-    """
-    双重查缓存：
-    1. URL hash（精确匹配，适用于普通 RSS）
-    2. 标题 hash（适用于 Google News 跳转 URL 每次不同的情况）
-    """
     return article_uid(a["url"]) in cache or title_uid(a["title"]) in cache
 
 def mark_seen(a: dict, cache: dict):
-    """同时写入 URL hash 和标题 hash"""
     cache[article_uid(a["url"])] = a["title"]
     cache[title_uid(a["title"])]  = a["title"]
 
@@ -706,34 +647,23 @@ def run_instant():
     print(f"\n[{datetime.now(SGT).strftime('%H:%M SGT')}] ▶ 实时监控")
     cache = load_cache()
 
-    # ── 冷启动保护 ──────────────────────────────────────────────
-    # 如果缓存为空（首次运行 or 缓存被清除），
-    # 只处理最近 30 分钟的文章，避免一次性推几十条。
     is_cold_start = len(cache) == 0
-    hours_back = 0.5 if is_cold_start else 2
+    hours_back    = 0.5 if is_cold_start else 2
     if is_cold_start:
-        print("[⚠️ 冷启动] 缓存为空，只处理最近30分钟的文章，防止洪水推送")
+        print("[⚠️ 冷启动] 缓存为空，只处理最近30分钟，防止洪水推送")
 
     raw     = fetch_all(hours_back=hours_back)
     matched = filter_keywords(raw)
-
-    # 过滤掉已推送（URL hash 或 标题 hash 命中）
     new     = [a for a in matched if not is_seen(a, cache)]
     deduped = deduplicate(new)
 
-    # ── 单次推送上限 ─────────────────────────────────────────────
-    # 即使去重后仍有很多条（例如缓存刚恢复），也最多推 INSTANT_MAX_PUSH 条，
-    # 剩余的只写入缓存（下次不再推），不发 Lark 消息。
     to_push  = deduped[:INSTANT_MAX_PUSH]
-    to_cache = deduped[INSTANT_MAX_PUSH:]  # 超出上限的只缓存不推
+    to_cache = deduped[INSTANT_MAX_PUSH:]
 
-    pushed = 0
     for a in to_push:
         push_instant(a)
         mark_seen(a, cache)
-        pushed += 1
 
-    # 超出上限的文章也写入缓存，避免下次再被推送
     for a in to_cache:
         mark_seen(a, cache)
 
@@ -741,8 +671,7 @@ def run_instant():
         print(f"[⚠️ 限流] {len(to_cache)} 条超出单次上限({INSTANT_MAX_PUSH})，已缓存但未推送")
 
     save_cache(cache)
-    print(f"[完成] 原始 {len(raw)} → 关键词匹配 {len(matched)} → "
-          f"新增未见 {len(new)} → 去重 {len(deduped)} → 实际推送 {pushed} 条\n")
+    print(f"[完成] 原始 {len(raw)} → 匹配 {len(matched)} → 新增 {len(new)} → 去重 {len(deduped)} → 推送 {len(to_push)} 条\n")
 
 
 def run_daily():
@@ -751,7 +680,7 @@ def run_daily():
     matched = filter_keywords(raw)
     deduped = deduplicate(matched)
     deduped.sort(key=lambda x: x["pub_dt"], reverse=True)
-    print(f"[统计] 原始 {len(raw)} → 关键词匹配 {len(matched)} → 去重后 {len(deduped)} 条")
+    print(f"[统计] 原始 {len(raw)} → 匹配 {len(matched)} → 去重后 {len(deduped)} 条")
     push_daily_digest(deduped)
 
 
@@ -760,64 +689,3 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["instant", "daily"], default="daily")
     args = parser.parse_args()
     run_instant() if args.mode == "instant" else run_daily()
-
-
-# ──────────────────────────────────────────────────────────────────
-# 信息源健康监控
-# ──────────────────────────────────────────────────────────────────
-
-def load_health() -> dict:
-    """加载信息源连续失败计数 {feed_name: fail_count}"""
-    if HEALTH_FILE.exists():
-        try:
-            return json.loads(HEALTH_FILE.read_text())
-        except Exception:
-            pass
-    return {}
-
-def save_health(health: dict):
-    HEALTH_FILE.write_text(json.dumps(health))
-
-def update_health_and_alert(status_lines: list[str]):
-    """
-    解析 fetch_all 的状态行，更新连续失败计数。
-    某个源连续失败 FEED_FAIL_ALERT_N 次，推送一条 Lark 告警。
-    """
-    health = load_health()
-    alerts = []
-
-    for line in status_lines:
-        # 解析格式：  ✅ [EN] CoinTelegraph: 5 条  或  ❌ [ZH] Odaily: HTTP 403
-        if "✅" in line:
-            name = line.split("]", 1)[-1].split(":")[0].strip()
-            health[name] = 0  # 成功，重置计数
-        elif "❌" in line:
-            name = line.split("]", 1)[-1].split(":")[0].strip()
-            health[name] = health.get(name, 0) + 1
-            count = health[name]
-            if count == FEED_FAIL_ALERT_N:
-                err = line.split(":", 2)[-1].strip() if ":" in line else "未知错误"
-                alerts.append(f"• **{name}** 已连续失败 {count} 次（{err}）")
-
-    save_health(health)
-
-    if alerts:
-        body = {
-            "msg_type": "interactive",
-            "card": {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {"tag": "plain_text", "content": "⚠️ RWA Bot 信息源异常告警"},
-                    "template": "red",
-                },
-                "elements": [
-                    {"tag": "div", "text": {"tag": "lark_md",
-                        "content": "以下信息源**连续失败 {} 次**，请检查：\n\n{}".format(
-                            FEED_FAIL_ALERT_N, "\n".join(alerts)
-                        )}},
-                    {"tag": "note", "elements": [{"tag": "plain_text",
-                        "content": "💡 应急：检查 RSS URL 是否变更，或在 RSS_FEEDS 中临时注释该源"}]},
-                ],
-            },
-        }
-        _post_lark(body, f"信息源告警：{len(alerts)} 个源异常")
