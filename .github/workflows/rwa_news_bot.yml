@@ -1,0 +1,106 @@
+name: RWA News Bot v3
+
+on:
+  schedule:
+    # 每日 09:00 SGT = UTC 01:00 → 日报
+    - cron: "0 1 * * *"
+    # 每小时实时监控，但跳过 01:00（那个时间点交给日报 job）
+    # 用 2,3,4,...,23,0 表示除 01 以外的每小时整点
+    - cron: "0 0,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 * * *"
+
+  # 手动触发，方便测试
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式"
+        required: true
+        default: "daily"
+        type: choice
+        options: [daily, instant]
+
+env:
+  LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+
+jobs:
+
+  # ────────────────────────────────────────────────────────
+  # Job 1：每日 09:00 SGT 日报汇总
+  # ────────────────────────────────────────────────────────
+  daily-digest:
+    name: 📰 Daily Digest (09:00 SGT)
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'daily')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .seen_articles.json
+            .feed_health.json
+          key: botstate-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: botstate-${{ runner.os }}-
+
+      - name: Run daily digest
+        run: python scripts/rwa_news_fetcher.py --mode daily
+
+      - name: Save bot state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            .seen_articles.json
+            .feed_health.json
+          key: botstate-${{ runner.os }}-${{ github.run_id }}
+
+  # ────────────────────────────────────────────────────────
+  # Job 2：每小时实时监控（已排除 01:00，避免与日报冲突）
+  # ────────────────────────────────────────────────────────
+  instant-monitor:
+    name: 🔔 Instant Monitor (hourly)
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 0,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'instant')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .seen_articles.json
+            .feed_health.json
+          key: botstate-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: botstate-${{ runner.os }}-
+
+      - name: Run instant monitor
+        run: python scripts/rwa_news_fetcher.py --mode instant
+
+      - name: Save bot state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            .seen_articles.json
+            .feed_health.json
+          key: botstate-${{ runner.os }}-${{ github.run_id }}
