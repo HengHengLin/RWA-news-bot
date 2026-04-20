@@ -192,11 +192,7 @@ RSS_FEEDS = [
         "url": "https://feeds.feedburner.com/CoinDesk",
         "tier": 3, "lang": "en",   # ✅ 实测可用
     },
-    {
-        "name": "CryptoBriefing",
-        "url": "https://cryptobriefing.com/feed/",
-        "tier": 3, "lang": "en",   # ✅ 实测可用
-    },
+    # CryptoBriefing 已移除：内容质量差，大量推送与 RWA 无关的比特币预测文章
     {
         "name": "NewsBTC",
         "url": "https://newsbtc.com/feed",
@@ -333,14 +329,22 @@ def update_health_and_alert(status_lines: list):
     alerts = []
 
     for line in status_lines:
+        # 格式：  ✅ [EN] CoinTelegraph: 1 条
+        #        ❌ [ZH] 吴说区块链 WuBlock: HTTP 403
+        # 取 [XX] 后面的部分，再以最后一个冒号分割，左边是名字，右边是错误
+        after_bracket = line.split("]", 1)[-1].strip() if "]" in line else line.strip()
+        if ":" in after_bracket:
+            name = after_bracket.rsplit(":", 1)[0].strip()
+            err  = after_bracket.rsplit(":", 1)[1].strip()
+        else:
+            name = after_bracket.strip()
+            err  = "未知错误"
+
         if "✅" in line:
-            name = line.split("]", 1)[-1].split(":")[0].strip()
             health[name] = 0
         elif "❌" in line:
-            name = line.split("]", 1)[-1].split(":")[0].strip()
             health[name] = health.get(name, 0) + 1
             if health[name] == FEED_FAIL_ALERT_N:
-                err = line.split(":", 2)[-1].strip() if line.count(":") >= 2 else "未知错误"
                 alerts.append(f"• **{name}** 已连续失败 {health[name]} 次（{err}）")
 
     save_health(health)
