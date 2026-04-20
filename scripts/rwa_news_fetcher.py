@@ -30,11 +30,18 @@ INSTANT_MAX_PUSH   = 8    # 单次实时运行最多推送条数（防洪水）
 
 KEYWORDS = [
 
-    # ── 核心概念 ─────────────────────────────────────────────────
+    # ── 核心概念（英文）──────────────────────────────────────────
     "RWA", "real world asset", "real-world asset",
     "asset tokenization", "tokenized asset", "tokenisation",
-    "资产代币化", "现实世界资产", "链上资产", "代币化",
-    "真实世界资产", "现实资产上链",
+
+    # ── 核心概念（中文）— 覆盖各媒体不同表达习惯 ─────────────────
+    # 动区动趋/PANews/Odaily 常用词形
+    "RWA赛道", "RWA项目", "RWA协议", "RWA市场",
+    "现实世界资产", "真实世界资产", "现实资产上链",
+    "资产代币化", "代币化资产", "链上资产",
+    "代币化",         # 单独匹配，覆盖「XXX代币化」句式
+    "通证化",         # 部分媒体用「通证化」而非「代币化」
+    "上链",           # 「资产上链」「股票上链」等句式
 
     # ── 资产类别（英文）──────────────────────────────────────────
     "tokenized treasury", "tokenized treasuries",
@@ -44,7 +51,7 @@ KEYWORDS = [
     "tokenized commodity", "tokenized credit",
     "tokenized security", "on-chain treasury",
     "on-chain securities", "on-chain equity",
-    "digital securities", "security token", "STO",
+    "digital securities", "security token",
     "fractional ownership blockchain",
 
     # ── 资产类别（中文）──────────────────────────────────────────
@@ -53,6 +60,10 @@ KEYWORDS = [
     "代币化股票", "代币化债券", "代币化基金",
     "代币化国债", "股票代币", "股票化代币",
     "证券代币", "证券通证", "通证化证券",
+    # 中文媒体常见说法补充
+    "美股代币", "美股通证", "股票通证化",
+    "债券代币化", "房地产代币化", "黄金代币化",
+    "国债代币化", "基金代币化",
 
     # ── Pre-IPO & IPO ─────────────────────────────────────────────
     "Pre-IPO", "pre IPO", "pre-IPO token", "IPO Prime",
@@ -60,11 +71,16 @@ KEYWORDS = [
     "preSPAX", "预上市", "Pre-IPO代币", "上市前代币",
     "IPO tokenization", "private equity token",
     "tokenized private equity", "unicorn token",
+    # 中文 Pre-IPO 表达
+    "Pre-IPO代币化", "上市前股权代币", "未上市股权",
 
     # ── TradFi / 传统金融上链 ─────────────────────────────────────
     "TradFi", "tradfi tokenization", "传统金融代币化",
     "传统资产上链", "机构级代币化", "机构级代币化平台",
     "institutional tokenization", "tokenized TradFi",
+    # 中文 TradFi 表达
+    "传统金融上链", "传统资产代币", "链上传统资产",
+    "链上金融", "机构入场",
 
     # ── 监管 & 牌照 ───────────────────────────────────────────────
     "SEC tokenization", "SEC tokenized", "SEC 代币化",
@@ -298,6 +314,54 @@ def jaccard(a: str, b: str, threshold: float = 0.55) -> bool:
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
+def extract_summary(entry: dict, max_chars: int = 150) -> str:
+    """
+    从 RSS entry 提取摘要，不依赖大模型：
+    1. 优先用 summary/description 字段（清理HTML后取前150字）
+    2. 如果太短（<30字），尝试 content 字段（部分源有全文）
+    3. 都没有则返回空字符串
+    最后做句子截断：不在句子中间断开，尽量在句号/问号处截断
+    """
+    # 尝试各字段
+    raw = ""
+    for field in ["summary", "description"]:
+        val = entry.get(field, "")
+        cleaned = strip_html(val).strip()
+        if len(cleaned) > len(raw):
+            raw = cleaned
+
+    # content 字段（部分源提供全文）
+    content_list = entry.get("content", [])
+    if content_list and len(raw) < 30:
+        for c in content_list:
+            val = strip_html(c.get("value", "")).strip()
+            if len(val) > len(raw):
+                raw = val
+
+    if not raw:
+        return ""
+
+    # 清理多余空白
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    if len(raw) <= max_chars:
+        return raw
+
+    # 在 max_chars 以内找最近的句子结束符断开，避免截断在词中间
+    truncated = raw[:max_chars]
+    for sep in ["。", "！", "？", ". ", "! ", "? "]:
+        pos = truncated.rfind(sep)
+        if pos > max_chars * 0.5:   # 找到且不太靠前
+            return truncated[:pos + len(sep)].strip()
+
+    # 找不到句号就在最近空格处截断
+    pos = truncated.rfind(" ")
+    if pos > max_chars * 0.5:
+        return truncated[:pos].strip() + "…"
+
+    return truncated.strip() + "…"
+
+
 def article_uid(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
 
@@ -401,7 +465,7 @@ def fetch_all(hours_back: float = 25) -> list:
 
                 title   = entry.get("title", "").strip()
                 url     = entry.get("link", "").strip()
-                summary = strip_html(entry.get("summary", entry.get("description", "")))[:500]
+                summary = extract_summary(entry)
                 if not title or not url:
                     continue
 
