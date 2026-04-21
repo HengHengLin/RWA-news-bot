@@ -22,6 +22,15 @@ HEALTH_FILE        = Path(__file__).parent.parent / ".feed_health.json"
 LARK_SEND_INTERVAL = 13   # 秒，Lark 限 5条/分钟，13s 间隔保证不超限
 LARK_MAX_RETRIES   = 3    # 单条推送最多重试次数
 FEED_FAIL_ALERT_N  = 3    # 连续失败 N 次触发 Lark 告警
+
+# 域名黑名单：这些来源是数据平台/价格聚合器，不是新闻，过滤掉
+URL_BLACKLIST_DOMAINS = [
+    "cryptorank.io",       # 数据平台，推的是价格页而非新闻
+    "coingecko.com",       # 价格聚合
+    "coinmarketcap.com",   # 价格聚合
+    "dune.com",            # 链上数据
+    "defillama.com",       # TVL 数据
+]
 INSTANT_MAX_PUSH   = 8    # 单次实时运行最多推送条数（防洪水）
 
 # ──────────────────────────────────────────────────────────────────
@@ -469,6 +478,10 @@ def fetch_all(hours_back: float = 25) -> list:
                 if not title or not url:
                     continue
 
+                # 黑名单域名过滤：数据平台链接不是新闻，跳过
+                if any(domain in url for domain in URL_BLACKLIST_DOMAINS):
+                    continue
+
                 # 中文乱码修复（GBK→UTF-8）
                 try:
                     title   = title.encode("latin-1").decode("utf-8")
@@ -515,6 +528,33 @@ def filter_keywords(articles: list) -> list:
             out.append(a)
     return out
 
+# 跨语言去重用的实体词提取（品牌名/数字/英文专有名词在中英文标题里都一样）
+def extract_entities(title: str) -> set:
+    """
+    提取标题里的实体：纯英文词、数字、品牌名（大写开头词）
+    用于跨语言去重——同一事件的中文和英文标题，实体集合高度重叠
+    例：'Bitget IPO Prime preSPAX 认购超1亿' 和 'Bitget IPO Prime preSPAX exceeds $100M'
+        实体集合都是 {'Bitget', 'IPO', 'Prime', 'preSPAX'}
+    """
+    # 提取所有英文词（长度>=3，包含大小写）和数字
+    tokens = re.findall(r'[A-Za-z][A-Za-z0-9]{2,}|\d+[MBKmb]?', title)
+    return {t.lower() for t in tokens}
+
+def entity_overlap(title_a: str, title_b: str, threshold: float = 0.6, min_intersection: int = 4) -> bool:
+    """
+    跨语言去重：用较小标题的实体集作分母，判断核心词命中比例。
+    要求交集至少 min_intersection 个词，避免 Bitget+IPO+Prime 等通用词误合并不同事件。
+    """
+    ea = extract_entities(title_a)
+    eb = extract_entities(title_b)
+    if len(ea) < 2 or len(eb) < 2:
+        return False
+    intersection = ea & eb
+    if len(intersection) < min_intersection:
+        return False
+    smaller = min(len(ea), len(eb))
+    return len(intersection) / smaller >= threshold
+
 def deduplicate(articles: list) -> list:
     sorted_arts = sorted(articles, key=lambda x: (x["tier"], x["pub_dt"]))
     seen_urls   = set()
@@ -523,7 +563,11 @@ def deduplicate(articles: list) -> list:
     for a in sorted_arts:
         if article_uid(a["url"]) in seen_urls:
             continue
+        # 同语言：Jaccard 词集合相似度
         if any(jaccard(a["title"], t) for t in seen_titles):
+            continue
+        # 跨语言：实体名重叠度（处理中英文报道同一事件）
+        if any(entity_overlap(a["title"], t) for t in seen_titles):
             continue
         seen_urls.add(article_uid(a["url"]))
         seen_titles.append(a["title"])
@@ -652,7 +696,13 @@ def push_daily_digest(articles: list):
         lines = [f"**{group_name}** · {len(arts)} 条"]
         for a in arts[:8]:
             flag = "🇨🇳 " if a.get("lang") == "zh" else ""
+            # 标题行（可点击链接）
             lines.append(f"• {flag}[{a['title'][:75]}]({a['url']})")
+            # 摘要行：有内容才显示，限60字，灰色字体作为副标题
+            summary = (a.get("summary") or "").strip()
+            if summary:
+                short = summary[:60] + ("…" if len(summary) > 60 else "")
+                lines.append(f"  <font color='grey'>{short}</font>")
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}})
         elements.append({"tag": "hr"})
 
