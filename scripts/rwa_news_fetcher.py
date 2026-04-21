@@ -489,12 +489,26 @@ def fetch_all(hours_back: float = 25) -> list:
                 except (UnicodeEncodeError, UnicodeDecodeError):
                     pass
 
+                # Google News RSS：从 entry.source.href 或 links 里取真实域名
+                real_url = ""
+                if cfg.get("is_google_news", False):
+                    src_href = entry.get("source", {}).get("href", "")
+                    if src_href:
+                        real_url = src_href.lower()
+                    else:
+                        for lnk in entry.get("links", []):
+                            href = lnk.get("href", "")
+                            if href and "google.com" not in href:
+                                real_url = href.lower()
+                                break
+
                 articles.append({
                     "source":    cfg["name"],
                     "tier":      cfg.get("tier", 3),
                     "lang":      cfg.get("lang", "en"),
                     "title":     title,
                     "url":       url,
+                    "real_url":  real_url,
                     "summary":   summary,
                     "published": pub_dt.strftime("%Y-%m-%d %H:%M SGT"),
                     "pub_dt":    pub_dt,
@@ -566,18 +580,28 @@ BLOCKED_DOMAINS = {
     "livebitcoinnews.com",
     "msn.com",
     "tradingview.com",
-    "coinpedia.org",       # 经常推广告性质文章
-    "zycrypto.com",        # 内容质量低
-    "coinchapter.com",     # 内容质量低
-    "thecoinrepublic.com", # 内容质量低
+    "yellow.com",
+    "citizen.co.za",
+    "coinpedia.org",
+    "zycrypto.com",
+    "coinchapter.com",
+    "thecoinrepublic.com",
+    "bitcoinist.com",
+    "cryptopotato.com",
+    "u.today",
 }
 
 def filter_blocked_domains(articles: list) -> list:
-    """过滤来自低质量域名的文章"""
+    """
+    过滤低质量域名。
+    Google News URL 是跳转链接，真实域名存在 real_url 字段里，两个都检查。
+    """
     out = []
     for a in articles:
-        url = a.get("url", "").lower()
-        blocked = any(domain in url for domain in BLOCKED_DOMAINS)
+        url      = a.get("url", "").lower()
+        real_url = a.get("real_url", "").lower()
+        check    = url + " " + real_url
+        blocked  = any(domain in check for domain in BLOCKED_DOMAINS)
         if not blocked:
             out.append(a)
         else:
@@ -644,6 +668,44 @@ def _post_lark(body: dict, label: str):
     print(f"[ERR] 推送失败，已放弃: {label}")
 
 
+def _format_summary(title: str, summary: str) -> str:
+    """
+    判断 summary 是否有意义：
+    - 如果为空，返回空字符串（不显示无意义的占位符）
+    - 如果和标题重叠度太高（>0.7），说明是标题的复述，也不显示
+    - 否则截取前200字，按句子断开，加换行让排版好看
+    """
+    if not summary or len(summary.strip()) < 20:
+        return ""
+
+    # 检查与标题的重叠度
+    title_words = set(normalize_title(title).split())
+    summary_words = set(normalize_title(summary).split())
+    if title_words and summary_words:
+        overlap = len(title_words & summary_words) / max(len(title_words), len(summary_words))
+        if overlap > 0.7:
+            return ""  # 摘要和标题基本一样，不显示
+
+    # 截取前200字，尽量在句号处断开
+    text = summary.strip()
+    if len(text) > 200:
+        truncated = text[:200]
+        for sep in ["。", "！", "？", ". ", "! ", "? "]:
+            pos = truncated.rfind(sep)
+            if pos > 100:
+                text = truncated[:pos + len(sep)].strip() + "…"
+                break
+        else:
+            pos = truncated.rfind(" ")
+            text = (truncated[:pos] if pos > 100 else truncated) + "…"
+
+    # 按句子加换行，让 Lark 卡片排版更清晰
+    for sep in [". ", "。", "！", "？"]:
+        text = text.replace(sep, sep + "\n")
+
+    return text.strip()
+
+
 def push_instant(a: dict):
     lang_flag = "🇨🇳" if a.get("lang") == "zh" else "🌐"
     kw_str = "  ".join([f"`{k}`" for k in a.get("matched_kws", [])[:5]])
@@ -665,7 +727,8 @@ def push_instant(a: dict):
             "header": {"title": {"tag": "plain_text", "content": f"{lang_flag} {badge}"}, "template": color},
             "elements": [
                 {"tag": "div", "text": {"tag": "lark_md", "content": f"**{a['title']}**"}},
-                {"tag": "div", "text": {"tag": "lark_md", "content": a["summary"] or "_（无摘要）_"}},
+                *([{"tag": "div", "text": {"tag": "lark_md", "content": _format_summary(a["title"], a.get("summary",""))}}]
+                  if _format_summary(a["title"], a.get("summary","")) else []),
                 {"tag": "hr"},
                 {"tag": "div", "fields": [
                     {"is_short": True, "text": {"tag": "lark_md", "content": f"**来源**\n{a['source']}"}},
