@@ -313,7 +313,7 @@ def normalize_title(t: str) -> str:
     words = [w for w in t.split() if w not in stopwords and len(w) > 1]
     return " ".join(sorted(words))
 
-def jaccard(a: str, b: str, threshold: float = 0.55) -> bool:
+def jaccard(a: str, b: str, threshold: float = 0.45) -> bool:
     sa = set(normalize_title(a).split())
     sb = set(normalize_title(b).split())
     if not sa or not sb:
@@ -531,16 +531,21 @@ def filter_keywords(articles: list) -> list:
 # 跨语言去重用的实体词提取（品牌名/数字/英文专有名词在中英文标题里都一样）
 def extract_entities(title: str) -> set:
     """
-    提取标题里的实体：纯英文词、数字、品牌名（大写开头词）
-    用于跨语言去重——同一事件的中文和英文标题，实体集合高度重叠
-    例：'Bitget IPO Prime preSPAX 认购超1亿' 和 'Bitget IPO Prime preSPAX exceeds $100M'
-        实体集合都是 {'Bitget', 'IPO', 'Prime', 'preSPAX'}
+    提取标题里的实体：纯英文词、数字、品牌名
+    过滤掉常见停用词，只保留有区分度的词
     """
-    # 提取所有英文词（长度>=3，包含大小写）和数字
+    ENTITY_STOPWORDS = {
+        'the','and','for','with','from','this','that','into','over',
+        'has','have','its','are','was','been','will','can','but',
+        'new','first','how','out','get','use','via','per',
+        'opens','brings','launches','makes','gets','gives',
+        'access','users','retail','guide','trade','profit',
+        'subscribe','subscription','unlocking','masses',
+    }
     tokens = re.findall(r'[A-Za-z][A-Za-z0-9]{2,}|\d+[MBKmb]?', title)
-    return {t.lower() for t in tokens}
+    return {t.lower() for t in tokens if t.lower() not in ENTITY_STOPWORDS}
 
-def entity_overlap(title_a: str, title_b: str, threshold: float = 0.6, min_intersection: int = 4) -> bool:
+def entity_overlap(title_a: str, title_b: str, threshold: float = 0.5, min_intersection: int = 2) -> bool:
     """
     跨语言去重：用较小标题的实体集作分母，判断核心词命中比例。
     要求交集至少 min_intersection 个词，避免 Bitget+IPO+Prime 等通用词误合并不同事件。
@@ -554,6 +559,30 @@ def entity_overlap(title_a: str, title_b: str, threshold: float = 0.6, min_inter
         return False
     smaller = min(len(ea), len(eb))
     return len(intersection) / smaller >= threshold
+
+# 低质量域名黑名单（来自 Google News RSS，内容质量差或与 RWA 无关）
+BLOCKED_DOMAINS = {
+    "beincrypto.com",
+    "livebitcoinnews.com",
+    "msn.com",
+    "tradingview.com",
+    "coinpedia.org",       # 经常推广告性质文章
+    "zycrypto.com",        # 内容质量低
+    "coinchapter.com",     # 内容质量低
+    "thecoinrepublic.com", # 内容质量低
+}
+
+def filter_blocked_domains(articles: list) -> list:
+    """过滤来自低质量域名的文章"""
+    out = []
+    for a in articles:
+        url = a.get("url", "").lower()
+        blocked = any(domain in url for domain in BLOCKED_DOMAINS)
+        if not blocked:
+            out.append(a)
+        else:
+            print(f"  [过滤] 黑名单域名: {a['title'][:50]}")
+    return out
 
 def deduplicate(articles: list) -> list:
     sorted_arts = sorted(articles, key=lambda x: (x["tier"], x["pub_dt"]))
@@ -772,6 +801,7 @@ def run_instant():
 
     raw     = fetch_all(hours_back=hours_back)
     matched = filter_keywords(raw)
+    matched = filter_blocked_domains(matched)
     new     = [a for a in matched if not is_seen(a, cache)]
     deduped = deduplicate(new)
 
@@ -796,6 +826,7 @@ def run_daily():
     print(f"\n[{datetime.now(SGT).strftime('%H:%M SGT')}] ▶ 生成日报")
     raw     = fetch_all(hours_back=25)
     matched = filter_keywords(raw)
+    matched = filter_blocked_domains(matched)
     deduped = deduplicate(matched)
     deduped.sort(key=lambda x: x["pub_dt"], reverse=True)
     print(f"[统计] 原始 {len(raw)} → 匹配 {len(matched)} → 去重后 {len(deduped)} 条")
