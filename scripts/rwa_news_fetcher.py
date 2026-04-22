@@ -245,7 +245,7 @@ def normalize_title(t: str) -> str:
     words = [w for w in t.split() if w not in stopwords and len(w) > 1]
     return " ".join(sorted(words))
 
-def jaccard(a: str, b: str, threshold: float = 0.4) -> bool:
+def jaccard(a: str, b: str, threshold: float = 0.35) -> bool:
     sa = set(normalize_title(a).split())
     sb = set(normalize_title(b).split())
     if not sa or not sb:
@@ -264,7 +264,7 @@ def extract_entities(title: str) -> set:
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9]{2,}|\d+[MBKmb]?", title)
     return {t.lower() for t in tokens if t.lower() not in ENTITY_STOPWORDS}
 
-def entity_overlap(a: str, b: str, threshold: float = 0.5, min_intersection: int = 2) -> bool:
+def entity_overlap(a: str, b: str, threshold: float = 0.4, min_intersection: int = 2) -> bool:
     ea = extract_entities(a)
     eb = extract_entities(b)
     if len(ea) < 2 or len(eb) < 2:
@@ -304,7 +304,7 @@ def deepseek_filter_and_summarize(articles: list) -> list:
 
     prompt = """你是一个专注于 RWA（Real World Assets，现实世界资产代币化）领域的信息筛选助手。
 
-以下是一批新闻文章，请对每篇做两件事：
+以下是一批新闻文章，请对每篇做三件事：
 1. 判断是否与以下主题真正相关（相关性评分 1-3，3=强相关，2=一般相关，1=不相关）：
    - RWA/现实世界资产代币化
    - 链上股票/债券/黄金/基金等资产
@@ -313,10 +313,14 @@ def deepseek_filter_and_summarize(articles: list) -> list:
    - 主流交易所的股票代币/RWA 新产品
    - 相关监管政策
 
-2. 如果评分 ≥ 2，用中文写一句话总结（30字以内），说明这条新闻的核心信息点
+2. 判断是否与列表中已有文章报道同一事件（duplicate=true/false）。
+   如果是同一事件的不同来源报道，只保留第一次出现的，后续标记 duplicate=true。
+   判断标准：核心事实相同（同一主体+同一动作），即使措辞不同也算重复。
+
+3. 如果评分 ≥ 2 且 duplicate=false，用中文写一句话总结（50字以内），包含关键主体、数据或影响。
 
 请严格按以下 JSON 格式返回，不要有任何额外文字：
-[{"id":0,"score":3,"summary":"BlackRock推出以太坊上代币化货币市场基金BUIDL，机构需求推动规模突破5亿美元"},{"id":1,"score":1,"summary":""},...]
+[{"id":0,"score":3,"duplicate":false,"summary":"BlackRock推出以太坊上代币化货币市场基金BUIDL，机构需求推动规模突破5亿美元"},{"id":1,"score":1,"duplicate":false,"summary":""},{"id":2,"score":3,"duplicate":true,"summary":""},...]
 
 文章列表：
 """ + "\n\n".join(items)
@@ -346,10 +350,11 @@ def deepseek_filter_and_summarize(articles: list) -> list:
         # 应用结果
         filtered = []
         for item in results:
-            idx   = item.get("id", -1)
-            score = item.get("score", 1)
-            summary = item.get("summary", "")
-            if 0 <= idx < len(articles) and score >= 2:
+            idx       = item.get("id", -1)
+            score     = item.get("score", 1)
+            duplicate = item.get("duplicate", False)
+            summary   = item.get("summary", "")
+            if 0 <= idx < len(articles) and score >= 2 and not duplicate:
                 a = articles[idx].copy()
                 if summary:
                     a["ai_summary"] = summary
@@ -789,17 +794,26 @@ def run_instant():
 
 def run_daily():
     print(f"\n[{datetime.now(SGT).strftime('%H:%M SGT')}] ▶ 生成日报")
+    cache = load_cache()
 
     raw     = fetch_all(hours_back=25)
     matched = filter_keywords(filter_blocked_domains(raw))
-    deduped = deduplicate(matched)
+    # 过滤掉已经推送过的（实时监控推过的 + 之前日报推过的）
+    new     = [a for a in matched if not is_seen(a, cache)]
+    deduped = deduplicate(new)
     deduped.sort(key=lambda x: x["pub_dt"], reverse=True)
 
     # DeepSeek 二次过滤 + 生成摘要
     final   = deepseek_filter_and_summarize(deduped)
 
-    print(f"[统计] 原始 {len(raw)} → 关键词 {len(matched)} → 去重 {len(deduped)} → AI筛后 {len(final)} 条")
+    print(f"[统计] 原始 {len(raw)} → 关键词 {len(matched)} → 新增 {len(new)} → 去重 {len(deduped)} → AI筛后 {len(final)} 条")
     push_daily_digest(final)
+
+    # 把日报推送过的全部写入缓存，防止后续重复推送
+    for a in final:
+        mark_seen(a, cache)
+    save_cache(cache)
+    print(f"[缓存] 已记录 {len(final)} 条日报文章")
 
 
 if __name__ == "__main__":
