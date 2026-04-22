@@ -212,13 +212,20 @@ RSS_FEEDS = [
 ]
 
 # 低质量域名黑名单
+# 注意：只屏蔽内容质量极差的源，不要过度屏蔽
+# Google News real_url 提取不稳定，保守处理
 BLOCKED_DOMAINS = {
-    "beincrypto.com", "livebitcoinnews.com", "msn.com",
-    "tradingview.com", "yellow.com", "citizen.co.za",
-    "coinpedia.org", "zycrypto.com", "coinchapter.com",
-    "thecoinrepublic.com", "bitcoinist.com", "cryptopotato.com",
-    "u.today", "newsbtc.com", "cryptonews.com",
-    "crypto.news", "bitcoinmagazine.com",  # 与 RWA 关联度低
+    "beincrypto.com",
+    "livebitcoinnews.com",
+    "msn.com",
+    "tradingview.com",
+    "yellow.com",
+    "citizen.co.za",
+    "coinpedia.org",
+    "zycrypto.com",
+    "coinchapter.com",
+    "thecoinrepublic.com",
+    "u.today",
 }
 
 # ──────────────────────────────────────────────────────────────────
