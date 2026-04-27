@@ -2,7 +2,7 @@ name: RWA Daily Digest
 
 on:
   schedule:
-    - cron: "0 1 * * *"    # 每天 UTC 01:00 = SGT 09:00
+    - cron: "0 23 * * *"    # 每天 UTC 23:00 = SGT 07:00（加上延迟约落在07:00-09:00）
   workflow_dispatch:
 
 env:
@@ -11,7 +11,7 @@ env:
 
 jobs:
   daily-digest:
-    name: 📰 Daily Digest (09:00 SGT)
+    name: 📰 Daily Digest (07:00 SGT)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
