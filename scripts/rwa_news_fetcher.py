@@ -80,13 +80,39 @@ KEYWORDS = [
     "virtual asset license", "digital asset license",
     "证券牌照", "代币化监管",
 
-    # 重点机构
+    # 重点机构（含专项监控机构）
     "Securitize", "Ondo Finance", "Backed Finance",
     "Maple Finance", "Centrifuge", "Goldfinch",
     "TrueFi", "Superstate", "Franklin Templeton BENJI",
     "BlackRock BUIDL", "OpenEden", "Matrixdock",
     "Swarm Markets", "Robinhood tokenized",
     "USD1", "Plume Network", "Mantra chain",
+
+    # ── 专项机构监控（新产品/新功能/新合作，不限于 RWA 词汇）────────
+    # MicroStrategy / Strategy — 任何新产品、融资、比特币相关动作
+    "MicroStrategy", "Strategy bitcoin", "MSTR",
+    "Michael Saylor", "Strategy preferred stock",
+    "Strategy convertible note", "Strategy ATM",
+    "MicroStrategy product", "MicroStrategy raises",
+    "微策略",
+
+    # Ondo Finance — 新产品线、新链、新合作
+    "Ondo Finance", "Ondo Global Markets", "OUSG", "OMMF",
+    "Ondo chain", "Ondo Bridge", "Ondo token",
+    "Ondo launches", "Ondo expands", "Ondo partners",
+
+    # BlackRock — 任何区块链/代币化相关动作
+    "BlackRock BUIDL", "BlackRock tokenized",
+    "BlackRock blockchain", "BlackRock digital",
+    "BlackRock crypto", "BlackRock bitcoin ETF",
+    "BlackRock Ethereum", "BlackRock DeFi",
+    "贝莱德代币化", "贝莱德区块链",
+
+    # Franklin Templeton — 任何链上产品动态
+    "Franklin Templeton BENJI", "Franklin OnChain",
+    "Franklin tokenized", "Franklin Templeton blockchain",
+    "Franklin Templeton digital", "Franklin Templeton fund",
+    "富兰克林代币化", "富兰克林链上",
 
     # 交易所专项
     "Bitget tokenized", "Bitget stock", "Bitget IPO Prime",
@@ -208,6 +234,35 @@ RSS_FEEDS = [
         "name": "Google News (中文): RWA 代币化",
         "url": "https://news.google.com/rss/search?q=RWA+%E4%BB%A3%E5%B8%81%E5%8C%96+OR+%E9%93%BE%E4%B8%8A%E8%82%A1%E7%A5%A8+OR+%E8%82%A1%E7%A5%A8%E4%BB%A3%E5%B8%81&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
         "tier": 3, "lang": "zh", "is_google_news": True,
+    },
+
+    # ════════════════════════════════════════════════════
+    # 梯队 4｜重点机构专项监控（不限于 RWA 关键词）
+    # 只要这些机构有任何新产品/新功能/融资/合作就触发
+    # ════════════════════════════════════════════════════
+    {
+        "name": "Google News: MicroStrategy",
+        "url": "https://news.google.com/rss/search?q=MicroStrategy+OR+%22Strategy+bitcoin%22+OR+%22Michael+Saylor%22+product+OR+raises+OR+launches+OR+preferred+OR+convertible&hl=en&gl=US&ceid=US:en",
+        "tier": 4, "lang": "en", "is_google_news": True,
+        # 捕捉：新产品（优先股/可转债）、融资行动、任何新公告
+    },
+    {
+        "name": "Google News: Ondo Finance",
+        "url": "https://news.google.com/rss/search?q=%22Ondo+Finance%22+OR+%22Ondo+Global+Markets%22+OR+OUSG+OR+%22Ondo+chain%22&hl=en&gl=US&ceid=US:en",
+        "tier": 4, "lang": "en", "is_google_news": True,
+        # 捕捉：新链上线、新产品、新合作方
+    },
+    {
+        "name": "Google News: BlackRock digital assets",
+        "url": "https://news.google.com/rss/search?q=BlackRock+%22tokenized%22+OR+%22blockchain%22+OR+%22digital+asset%22+OR+BUIDL&hl=en&gl=US&ceid=US:en",
+        "tier": 4, "lang": "en", "is_google_news": True,
+        # 捕捉：BUIDL 基金动态、任何区块链相关行动
+    },
+    {
+        "name": "Google News: Franklin Templeton OnChain",
+        "url": "https://news.google.com/rss/search?q=%22Franklin+Templeton%22+%22tokenized%22+OR+%22blockchain%22+OR+%22OnChain%22+OR+BENJI&hl=en&gl=US&ceid=US:en",
+        "tier": 4, "lang": "en", "is_google_news": True,
+        # 捕捉：BENJI 基金动态、新链上线、合作公告
     },
 ]
 
@@ -600,49 +655,91 @@ def _post_lark(body: dict, label: str):
     print(f"[ERR] 推送失败，放弃: {label}")
 
 
-def push_instant(a: dict):
-    lang_flag = "🇨🇳" if a.get("lang") == "zh" else "🌐"
-    kw_str    = "  ".join([f"`{k}`" for k in a.get("matched_kws", [])[:4]])
+def _event_type(a: dict) -> str:
+    """根据关键词推断事件类型标签"""
+    kws = " ".join(a.get("matched_kws", [])).lower()
+    title_l = a["title"].lower()
+    if any(k in kws for k in ["pre-ipo", "ipo prime", "预上市", "prespax"]):
+        return "Pre-IPO 代币化"
+    if any(k in title_l for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"]):
+        return "交易所动态"
+    if any(k in kws for k in ["xstocks","stablestock","链上股票","股票代币","tokenized stock"]):
+        return "股票代币化"
+    if any(k in kws for k in ["sec","cftc","mica","regulation","牌照","监管"]):
+        return "监管政策"
+    if any(k in title_l for k in ["microstrategy","mstr","michael saylor","微策略"]):
+        return "MicroStrategy 动态"
+    if any(k in title_l for k in ["ondo finance","ousg","ondo chain","ondo global"]):
+        return "Ondo Finance 动态"
+    if any(k in title_l for k in ["blackrock buidl","blackrock tokenized","blackrock blockchain"]):
+        return "BlackRock 动态"
+    if any(k in title_l for k in ["franklin templeton","benji","franklin onchain"]):
+        return "Franklin Templeton 动态"
+    if any(k in kws for k in ["securitize","backed","maple","superstate"]):
+        return "机构动态"
+    if any(k in kws for k in ["tokenized treasury","tokenized bond","链上国债","代币化债券"]):
+        return "债券/国债"
+    if any(k in kws for k in ["tokenized gold","链上黄金","黄金代币"]):
+        return "黄金代币化"
+    return "RWA 资讯"
 
+
+def push_instant(a: dict):
     kws_lower = str(a.get("matched_kws", "")).lower()
     title_l   = a["title"].lower()
-    if any(k in kws_lower for k in ["pre-ipo","ipo prime","pre ipo","预上市"]):
-        badge, color = "🔮 Pre-IPO", "purple"
-    elif any(k in title_l for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"]):
-        badge, color = "🏦 交易所动态", "orange"
-    elif any(k in kws_lower for k in ["xstocks","stablestock","jarsy","prestocks","链上股票","股票代币"]):
-        badge, color = "📈 股票代币化", "indigo"
-    else:
-        badge, color = "📡 RWA 快讯", "blue"
 
-    # 优先用 AI 总结，没有的话不显示摘要
+    # 卡片颜色
+    if any(k in kws_lower for k in ["pre-ipo","ipo prime","预上市"]):
+        color = "purple"
+    elif any(k in title_l for k in ["binance","bitget","bybit","gate","okx","kraken","coinbase"]):
+        color = "orange"
+    elif any(k in kws_lower for k in ["xstocks","stablestock","链上股票","股票代币"]):
+        color = "indigo"
+    else:
+        color = "blue"
+
     ai_summary = a.get("ai_summary", "")
+    summary    = a.get("summary", "")
+    event_type = _event_type(a)
+    lang_label = "中文" if a.get("lang") == "zh" else "英文"
+
+    # 构建字段内容，对齐截图格式
+    fields_md = "\n".join([
+        f"**信息渠道：** {a['source']}（{lang_label}）",
+        f"**事件类型：** {event_type}",
+        f"**概要：** {ai_summary or a['title']}",
+    ])
+    if summary and summary.strip() and summary.strip() != a["title"].strip():
+        fields_md += f"\n**原文摘要：** {summary[:200]}"
 
     elements = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": f"**{a['title']}**"}},
-    ]
-    if ai_summary:
-        elements.append(
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"💡 {ai_summary}"}}
-        )
-    elements += [
+        {"tag": "div", "text": {"tag": "lark_md", "content": fields_md}},
         {"tag": "hr"},
-        {"tag": "div", "fields": [
-            {"is_short": True, "text": {"tag": "lark_md", "content": f"**来源**\n{a['source']}"}},
-            {"is_short": True, "text": {"tag": "lark_md", "content": f"**时间**\n{a['published']}"}},
-        ]},
-        {"tag": "div", "text": {"tag": "lark_md", "content": f"**关键词** · {kw_str}"}},
-        {"tag": "action", "actions": [
-            {"tag": "button", "text": {"tag": "plain_text", "content": "阅读原文 →"},
-             "type": "primary", "url": a["url"]}
-        ]},
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "阅读原文 →"},
+                    "type": "primary",
+                    "url": a["url"],
+                }
+            ],
+        },
+        {
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": f"🕐 {a['published']}"}],
+        },
     ]
 
     body = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": f"{lang_flag} {badge}"}, "template": color},
+            "header": {
+                "title": {"tag": "plain_text", "content": "📡 RWA 实时快讯"},
+                "template": color,
+            },
             "elements": elements,
         },
     }
@@ -657,11 +754,12 @@ def push_daily_digest(articles: list):
     today = datetime.now(SGT).strftime("%Y年%m月%d日")
 
     groups = {
-        "🔮 Pre-IPO 动态":  [],
-        "🏦 交易所 & 平台":  [],
-        "📈 股票代币化":     [],
-        "🌐 英文 RWA 资讯":  [],
-        "🇨🇳 中文 RWA 资讯": [],
+        "🔮 Pre-IPO 动态":     [],
+        "🏦 交易所 & 平台":     [],
+        "📈 股票代币化":        [],
+        "🏛️ 机构专项动态":     [],   # MicroStrategy / Ondo / BlackRock / Franklin
+        "🌐 英文 RWA 资讯":     [],
+        "🇨🇳 中文 RWA 资讯":   [],
     }
 
     for a in articles:
@@ -673,6 +771,11 @@ def push_daily_digest(articles: list):
             groups["🏦 交易所 & 平台"].append(a)
         elif any(k in kws for k in ["xstocks","stablestock","jarsy","prestocks","链上股票","股票代币","stock token","tokenized stock"]):
             groups["📈 股票代币化"].append(a)
+        elif any(k in tl for k in ["microstrategy","mstr","michael saylor","微策略",
+                                    "ondo finance","ousg","ondo chain",
+                                    "blackrock buidl","blackrock tokenized","blackrock blockchain",
+                                    "franklin templeton","benji","franklin onchain"]):
+            groups["🏛️ 机构专项动态"].append(a)
         elif a.get("lang") == "zh":
             groups["🇨🇳 中文 RWA 资讯"].append(a)
         else:
@@ -693,13 +796,16 @@ def push_daily_digest(articles: list):
             continue
         lines = [f"**{group_name}** · {len(arts)} 条"]
         for a in arts[:8]:
-            flag       = "🇨🇳 " if a.get("lang") == "zh" else ""
             ai_summary = a.get("ai_summary", "")
-            # 标题完整显示（不截断）
-            lines.append(f"• {flag}[{a['title']}]({a['url']})")
-            # AI 总结显示在标题下方，用小字体缩进
+            lang_label = "🇨🇳" if a.get("lang") == "zh" else "🌐"
+            event_type = _event_type(a)
+            # 标题行（可点击）
+            lines.append(f"\n**{lang_label} [{a['title']}]({a['url']})**")
+            # 结构化字段
+            lines.append(f"信息渠道： {a['source']}")
+            lines.append(f"事件类型： {event_type}")
             if ai_summary:
-                lines.append(f"  💡 {ai_summary}")
+                lines.append(f"概要： {ai_summary}")
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}})
         elements.append({"tag": "hr"})
 
